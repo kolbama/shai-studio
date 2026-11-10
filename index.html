@@ -122,6 +122,15 @@ textarea.inp { min-height: 80px; resize: vertical }
 .locked .tabs, .locked .switch, .locked .brand .small-btn { display: none }
 .lock { max-width: 380px; margin: 48px auto 0; display: grid; gap: 14px; text-align: center }
 .lock p { margin: 0; color: var(--muted) }
+.lock form { display: grid; gap: 14px }
+.app-foot { margin: 28px 0 8px; padding-top: 14px; border-top: 1px solid var(--line, #ddd); display: grid; gap: 8px; justify-items: center; text-align: center; font-size: 14px; color: var(--muted) }
+.app-foot p { margin: 0 }
+.app-foot .linkish { min-height: 32px }
+.rules { list-style: none; padding: 0; margin: 0 0 6px; display: grid; gap: 10px }
+.rules li { display: grid; grid-template-columns: 22px 1fr; gap: 6px; align-items: start; line-height: 1.5 }
+.rules .ok { color: var(--tone); font-weight: 700 }
+.rules .no { color: #b3261e; font-weight: 700 }
+.linkish { background: none; border: 0; padding: 0; font: inherit; color: var(--tone); text-decoration: underline; cursor: pointer }
 .lock .err { color: var(--warn); font-weight: 700; min-height: 1.4em }
 .sec-edit { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px; display: flex; flex-direction: column; gap: 10px }
 .sec-edit .sec-row { display: grid; grid-template-columns: 1fr 84px auto; gap: 8px; align-items: center }
@@ -144,6 +153,9 @@ details.pop { background: var(--card); border: 1px solid var(--line); border-rad
 details.pop summary { cursor: pointer; padding: 14px 16px; font-weight: 700; font-size: 18px; list-style: none; display: flex; justify-content: space-between; gap: 8px }
 details.pop summary::after { content: "+"; color: var(--tone); font-size: 22px; line-height: 1 }
 details.pop[open] summary::after { content: "–" }
+details.tips { margin-bottom: 14px }
+details.tips h4 { margin: 10px 0 4px }
+details.tips ul { margin: 0; padding-inline-start: 20px }
 .pop-body { padding: 0 16px 16px; display: flex; flex-direction: column; gap: 10px }
 .pop-body h3 { margin: 6px 0 0; font-size: 15px; color: var(--tone) }
 .pop-body ul { margin: 0; padding-inline-start: 20px; display: flex; flex-direction: column; gap: 4px }
@@ -202,57 +214,139 @@ details.pop[open] summary::after { content: "–" }
 <div id="overlay" dir="rtl"></div>
 <div id="toast-wrap" dir="rtl" aria-live="polite"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script>
-/* ===== Boot: get the content, then start the app.
-   Here and inside Claude: plain data.js. On the public site (github.io): only data.enc exists,
-   encrypted with Shai's entry code (made by tools\lock-data.ps1). The code is remembered on her phone. ===== */
+/* ===== Boot: sign in, get the content from the cloud (Supabase project "shai-studio"), then start the app.
+   - Built-in content (POP, GUIDE, BARRE_TIPS, EX, PLANS) lives in table "content".
+   - Shai's own plans / exercises / "taught today" live in "plans", "exercises", "taught".
+   - The phone keeps a working copy (localStorage "shai_db") and a copy of what the cloud has ("shai_synced").
+     Every save sends only the difference. Offline: the app works from the copies and sends later.
+   - First run on this computer (localhost with data.js): if the cloud is empty, data.js is uploaded once. ===== */
 (function () {
-  const PUBLIC = /github\.io$/.test(location.hostname) || /[?&]lock\b/.test(location.search);
+  const SB_URL = "https://fzwnsoektgpfawpmneei.supabase.co";
+  const SB_KEY = "sb_publishable_vxAzEuHhiA1jH3oZZtigDg_80Pex3Ez";   // public key, safe in the browser (tables are locked with RLS)
+  const LOCAL = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+  const main = document.getElementById("main");
+  const ls = { get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
+               set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } } };
   const addScript = text => { const s = document.createElement("script"); s.textContent = text; document.body.appendChild(s); };
-  const startApp = () => { document.body.classList.remove("locked"); addScript(document.getElementById("app-code").textContent); };
-  const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-  async function unlock(code) {
-    const res = await fetch("data.enc", { cache: "no-cache" });
-    if (!res.ok) throw new Error("missing");
-    const f = await res.json(), iv = b64(f.iv), ct = b64(f.ct);
-    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(code.normalize("NFC").trim()), "PBKDF2", false, ["deriveBits"]);
-    const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: b64(f.salt), iterations: f.it }, base, 512));
-    const macKey = await crypto.subtle.importKey("raw", bits.slice(32), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
-    const signed = new Uint8Array(iv.length + ct.length); signed.set(iv); signed.set(ct, iv.length);
-    if (!(await crypto.subtle.verify("HMAC", macKey, b64(f.mac), signed))) throw new Error("wrong");
-    const encKey = await crypto.subtle.importKey("raw", bits.slice(0, 32), "AES-CBC", false, ["decrypt"]);
-    return new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-CBC", iv }, encKey, ct));
+  const loadScript = src => new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = rej; document.body.appendChild(s); });
+  const say = (html) => { document.body.classList.add("locked"); main.innerHTML = `<div class="lock">${html}</div>`; };
+  let started = false;
+  const startApp = () => { if (started) return; started = true; document.body.classList.remove("locked"); addScript(document.getElementById("app-code").textContent); };
+
+  if (!window.supabase) { say(`<h2>אין חיבור</h2><p>צריך אינטרנט כדי לפתוח את האפליקציה בפעם הראשונה. נסי שוב בעוד רגע.</p>`); return; }
+  const sb = window.supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: true, autoRefreshToken: true, storageKey: "shai_sb_auth" } });
+
+  /* ---- Sync: compare the working copy with the cloud copy and send only what changed ---- */
+  const snapOf = db => {
+    const s = { p: {}, e: {}, t: {} };
+    (db.plans || []).forEach((p, i) => { s.p[p.id] = JSON.stringify([p, i]); });
+    Object.values(db.ex || {}).forEach(x => { s.e[x.id] = JSON.stringify(x); });
+    Object.entries(db.log || {}).forEach(([pid, days]) => (days || []).forEach(d => { s.t[pid + "|" + d] = 1; }));
+    return s;
+  };
+  let busy = false, again = false, timer = null;
+  async function syncNow() {
+    if (busy) { again = true; return; }
+    busy = true;
+    try {
+      const db = ls.get("shai_db", { plans: [], ex: {}, log: {} });
+      const cur = snapOf(db), old = ls.get("shai_synced", { p: {}, e: {}, t: {} });
+      const upP = [], upE = [], addT = [], delT = [];
+      for (const id in cur.p) if (cur.p[id] !== old.p[id]) { const [p, i] = JSON.parse(cur.p[id]); upP.push({ id, data: p, sort: i, deleted: false }); }
+      for (const id in old.p) if (!(id in cur.p)) upP.push({ id, data: JSON.parse(old.p[id])[0], sort: 0, deleted: true });
+      for (const id in cur.e) if (cur.e[id] !== old.e[id]) upE.push({ id, data: JSON.parse(cur.e[id]), deleted: false });
+      for (const id in old.e) if (!(id in cur.e)) upE.push({ id, data: JSON.parse(old.e[id]), deleted: true });
+      for (const k in cur.t) if (!old.t[k]) { const i = k.lastIndexOf("|"); addT.push({ plan_id: k.slice(0, i), day: k.slice(i + 1) }); }
+      for (const k in old.t) if (!cur.t[k]) delT.push(k);
+      if (!upP.length && !upE.length && !addT.length && !delT.length) return true;
+      const chk = r => { if (r.error) throw r.error; };
+      if (upP.length) chk(await sb.from("plans").upsert(upP));
+      if (upE.length) chk(await sb.from("exercises").upsert(upE));
+      if (addT.length) chk(await sb.from("taught").upsert(addT, { onConflict: "plan_id,day", ignoreDuplicates: true }));
+      for (const k of delT) { const i = k.lastIndexOf("|"); chk(await sb.from("taught").delete().match({ plan_id: k.slice(0, i), day: k.slice(i + 1) })); }
+      ls.set("shai_synced", cur);
+      return true;
+    } catch (e) { console.warn("[shai] sync failed, will retry", e); return false; }
+    finally { busy = false; if (again) { again = false; setTimeout(syncNow, 300); } }
   }
-  const mem = { get() { try { return localStorage.getItem("shai_code"); } catch (e) { return null; } },
-                set(v) { try { v ? localStorage.setItem("shai_code", v) : localStorage.removeItem("shai_code"); } catch (e) {} } };
-  function lockScreen(msg) {
-    document.body.classList.add("locked");
-    document.getElementById("main").innerHTML = `<form class="lock" id="lock-form">
+  window.CLOUD = {
+    sync() { clearTimeout(timer); timer = setTimeout(syncNow, 700); },
+    async signOut() { await syncNow(); await sb.auth.signOut(); ["shai_synced", "shai_db", "shai_content"].forEach(k => { try { localStorage.removeItem(k); } catch (e) {} }); location.reload(); },
+    email: "",
+    sb,
+  };
+  window.addEventListener("online", () => CLOUD.sync());
+
+  /* ---- Content ---- */
+  function useContent(c) { ["POP", "GUIDE", "BARRE_TIPS", "EX", "PLANS"].forEach(k => { window[k] = c[k]; }); }
+  async function seedFromDataJs() {
+    await loadScript("data.js");   // defines POP, GUIDE, BARRE_TIPS, EX, PLANS
+    const rows = [["POP", POP], ["GUIDE", GUIDE], ["BARRE_TIPS", typeof BARRE_TIPS !== "undefined" ? BARRE_TIPS : []], ["EX", EX], ["PLANS", PLANS]].map(([key, data]) => ({ key, data }));
+    const r = await sb.from("content").upsert(rows); if (r.error) throw r.error;
+    return Object.fromEntries(rows.map(r => [r.key, JSON.parse(JSON.stringify(r.data))]));
+  }
+
+  async function loadAndStart() {
+    say(`<p>טוען...</p>`);
+    await syncNow();   // send what was changed here before taking the cloud copy
+    let content = null, cloud = null;
+    try {
+      const [c, p, x, t] = await Promise.all([
+        sb.from("content").select("key,data"),
+        sb.from("plans").select("id,data,sort").eq("deleted", false).order("sort"),
+        sb.from("exercises").select("id,data").eq("deleted", false),
+        sb.from("taught").select("plan_id,day").order("day"),
+      ]);
+      [c, p, x, t].forEach(r => { if (r.error) throw r.error; });
+      content = Object.fromEntries(c.data.map(r => [r.key, r.data]));
+      cloud = { plans: p.data.map(r => r.data), ex: {}, log: {} };
+      x.data.forEach(r => { cloud.ex[r.id] = r.data; });
+      t.data.forEach(r => { (cloud.log[r.plan_id] = cloud.log[r.plan_id] || []).push(r.day); });
+    } catch (e) { console.warn("[shai] offline or cloud error", e); }
+
+    if (content && !content.EX) {
+      if (!LOCAL) { say(`<h2>עוד רגע</h2><p>התוכן עוד לא הועלה לענן. גיא צריך לפתוח את האפליקציה פעם אחת מהמחשב.</p>`); return; }
+      try { content = await seedFromDataJs(); } catch (e) { console.error(e); say(`<h2>ההעלאה לענן נכשלה</h2><p>נסו שוב.</p>`); return; }
+    }
+    if (content) { ls.set("shai_content", content); }
+    else { content = ls.get("shai_content", null); if (!content) { say(`<h2>אין חיבור</h2><p>צריך אינטרנט כדי לפתוח את האפליקציה בפעם הראשונה. נסי שוב בעוד רגע.</p>`); return; } }
+    if (!window.POP) useContent(content);   // data.js (seed) already defined them
+
+    if (cloud) {   // the cloud is the truth; keep this device's view settings
+      const local = ls.get("shai_db", {});
+      ls.set("shai_db", Object.assign({}, local, { v: 1, plans: cloud.plans, ex: cloud.ex, log: cloud.log }));
+      ls.set("shai_synced", snapOf(cloud));
+    }
+    startApp();
+  }
+
+  function loginScreen(msg) {
+    say(`<form id="login-form">
       <h2>ברוכה הבאה</h2>
-      <p>מקלידים את קוד הכניסה פעם אחת, והטלפון יזכור אותו.</p>
-      <label for="lock-code" class="sr-only">קוד כניסה</label>
-      <input class="inp" id="lock-code" type="password" autocomplete="current-password" placeholder="קוד כניסה" required>
+      <p>נכנסים פעם אחת, והטלפון יזכור.</p>
+      <label for="login-email" class="sr-only">מייל</label>
+      <input class="inp" id="login-email" type="email" autocomplete="username" inputmode="email" dir="ltr" placeholder="מייל" required>
+      <label for="login-pass" class="sr-only">סיסמה</label>
+      <input class="inp" id="login-pass" type="password" autocomplete="current-password" dir="ltr" placeholder="סיסמה" required>
       <button class="btn wide" type="submit">כניסה</button>
-      <div class="err" role="alert">${msg || ""}</div></form>`;
-    const form = document.getElementById("lock-form");
+      <div class="err" role="alert">${msg || ""}</div></form>`);
+    const form = document.getElementById("login-form");
     form.addEventListener("submit", async e => {
       e.preventDefault();
-      const code = document.getElementById("lock-code").value, btn = form.querySelector("button"), err = form.querySelector(".err");
-      btn.disabled = true; btn.textContent = "פותח..."; err.textContent = "";
-      try { const text = await unlock(code); mem.set(code); addScript(text); startApp(); }
-      catch (x) { btn.disabled = false; btn.textContent = "כניסה"; err.textContent = x.message === "wrong" ? "הקוד לא נכון. נסי שוב." : "אין חיבור לאינטרנט. נסי שוב בעוד רגע."; }
+      const btn = form.querySelector("button"), err = form.querySelector(".err");
+      btn.disabled = true; btn.textContent = "נכנסת..."; err.textContent = "";
+      const { data, error } = await sb.auth.signInWithPassword({ email: document.getElementById("login-email").value.trim().toLowerCase(), password: document.getElementById("login-pass").value });
+      if (error) { btn.disabled = false; btn.textContent = "כניסה"; err.textContent = /invalid/i.test(error.message) ? "המייל או הסיסמה לא נכונים. נסי שוב." : "אין חיבור לאינטרנט. נסי שוב בעוד רגע."; return; }
+      CLOUD.email = data.user.email; loadAndStart();
     });
   }
-  async function viaCode() {
-    const code = mem.get();
-    if (code) {
-      try { addScript(await unlock(code)); startApp(); return; }
-      catch (x) { if (x.message === "wrong") mem.set(null); return lockScreen(x.message === "wrong" ? "" : "אין חיבור לאינטרנט. נסי שוב בעוד רגע."); }
-    }
-    lockScreen();
-  }
-  if (PUBLIC) { viaCode(); return; }
-  const s = document.createElement("script"); s.src = "data.js"; s.onload = startApp; s.onerror = viaCode; document.body.appendChild(s);
+
+  sb.auth.getSession().then(({ data }) => {
+    if (data.session) { CLOUD.email = data.session.user.email; loadAndStart(); }
+    else loginScreen();
+  }).catch(() => loginScreen());
 })();
 </script>
 <script id="app-code" type="text/plain">
@@ -265,11 +359,13 @@ Object.assign(EX, DB.ex);
 function save() {
   if (!store.set("shai_db", DB)) toast("השמירה נכשלה. אולי הזיכרון בטלפון מלא.");
   const b = store.get("shai_bk", {}); if (!b.dirty) store.set("shai_bk", { at: b.at || Date.now(), dirty: true });
+  if (window.CLOUD) CLOUD.sync();   // send the change to the cloud (retries later if offline)
 }
 /* Backup reminder: "at" = last backup (or first change), "dirty" = changed since then. Shown after 14 days, "later" hides it for 3 days. */
 const BK_DAYS = 14;
 function markBackedUp() { store.set("shai_bk", { at: Date.now(), dirty: false }); store.set("shai_bk_snooze", 0); }
 function needsBackup() {
+  if (window.CLOUD) return false;   // everything is saved in the cloud now
   const b = store.get("shai_bk", {});
   return !!(b.dirty && b.at && Date.now() - b.at > BK_DAYS * 864e5 && Date.now() > (store.get("shai_bk_snooze", 0) || 0));
 }
@@ -289,7 +385,7 @@ let videoIds = new Set();
 VID.keys().then(k => { videoIds = new Set(k || []); if (S.tab === "lib") render(); }).catch(() => {});
 
 /* ===== State ===== */
-const S = { mode: store.get("shai_mode", "barre"), tab: "plans", plan: null, edit: null, today: store.get("shai_today", []), q: "", area: "", sort: store.get("shai_sort", "default"), confirm: null };
+const S = { mode: store.get("shai_mode", "barre"), tab: "plans", plan: null, edit: null, today: store.get("shai_today", []), q: "", area: "", sort: store.get("shai_sort", "default"), src: store.get("shai_src", "all"), confirm: null };
 const main = document.getElementById("main");
 const overlay = document.getElementById("overlay");
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
@@ -344,14 +440,22 @@ function viewPlans() {
   if (S.edit) return viewEdit(findPlan(S.edit));
   if (S.plan) return viewPlan(findPlan(S.plan));
   const mine = sortPlans(DB.plans.filter(p => p.t === S.mode));
-  const ready = sortPlans(PLANS.filter(p => p.t === S.mode));
+  const all = PLANS.filter(p => p.t === S.mode);
+  const isShais = p => (p.tags || []).includes("של שי");
+  const nShai = all.filter(isShais).length;
+  const ready = sortPlans(S.src === "shai" ? all.filter(isShais) : S.src === "general" ? all.filter(p => !isShais(p)) : all);
   const lead = S.mode === "barre" ? "מערכים מגוונים, עם דגש על העבודה ליד הבר. כל מערך בנוי ל־50–55 דקות." : "מערכים לשיעור מזרון. בכל תרגיל יש גרסה קלה וקשה, והתאמות למקרים מיוחדים.";
-  return `${todayBox()}
+  const tips = S.mode === "barre" && typeof BARRE_TIPS !== "undefined" ? `<details class="pop tips"><summary>טיפים לבר מהחוברת</summary><div class="pop-body">
+    ${BARRE_TIPS.map(([h, items]) => `<h4>${esc(h)}</h4><ul>${items.map(i => `<li>${esc(i)}</li>`).join("")}</ul>`).join("")}</div></details>` : "";
+  const srcChips = nShai ? `<div class="chips" role="group" aria-label="אילו מערכים">${[["all", "הכול"], ["shai", "של שי"], ["general", "כלליים"]].map(([k, v]) =>
+    `<button type="button" class="chip f" data-a="src" data-id="${k}" aria-pressed="${(S.src || "all") === k}">${v}</button>`).join("")}</div>` : "";
+  return `${todayBox()}${tips}
   <div class="chips" role="group" aria-label="סדר"><button type="button" class="chip f" data-a="sort" data-id="default" aria-pressed="${S.sort !== "oldest"}">סדר רגיל</button><button type="button" class="chip f" data-a="sort" data-id="oldest" aria-pressed="${S.sort === "oldest"}">מה שלא עשיתי הכי הרבה זמן</button></div>
   <div class="list-head"><h2>המערכים שלי</h2><button type="button" class="btn ghost" data-a="new-plan">+ מערך חדש</button></div>
   ${mine.length ? `<div class="plans">${mine.map(planCard).join("")}</div>` : `<div class="empty">עוד אין מערכים משלך. אפשר ללחוץ "מערך חדש", או לפתוח מערך מוכן וללחוץ "שכפול ועריכה".</div>`}
   <h2>${S.mode === "barre" ? "מערכי בר מוכנים" : "מערכי מזרון מוכנים"}</h2><p class="lead">${lead}</p>
-  <div class="plans">${ready.map(planCard).join("")}</div>`;
+  ${srcChips}
+  <div class="plans">${ready.length ? ready.map(planCard).join("") : `<div class="empty">אין כאן מערכים כרגע.</div>`}</div>`;
 }
 function viewPlan(p) {
   if (!p) { S.plan = null; return viewPlans(); }
@@ -443,6 +547,29 @@ function render() {
   if (S.tab === "plans" && !S.plan && !S.edit && needsBackup()) main.insertAdjacentHTML("afterbegin",
     `<div class="bk-remind" role="status"><p><b>הגיע הזמן לגיבוי.</b> עברו יותר משבועיים, ויש שינויים שנשמרו רק בטלפון הזה.</p>
      <div class="row"><button type="button" class="btn" data-a="backup">גיבוי עכשיו</button><button type="button" class="btn ghost" data-a="bk-later">אחר כך</button></div></div>`);
+  if (!S.plan && !S.edit) main.insertAdjacentHTML("beforeend", `<footer class="app-foot">
+    ${window.CLOUD ? `<p>💡 יש לך הצעה לשיפור? <button type="button" class="linkish" data-a="idea">כתבי כאן</button></p>` : ""}
+    <p><button type="button" class="linkish" data-a="privacy">מה מותר לכתוב כאן</button></p></footer>`);
+}
+
+/* Privacy rules: shown once after the first sign-in, and always from the footer link */
+function openPrivacy(first) {
+  sheetCtx = { kind: "privacy" };
+  sheet(`<h3 id="sheet-title">שומרים על המתאמנות</h3>
+    <ul class="rules">
+      <li><span class="ok" aria-hidden="true">✓</span><span><b>מותר:</b> מערכים, תרגילים, התאמות כלליות (למשל "גב תחתון")</span></li>
+      <li><span class="no" aria-hidden="true">✗</span><span><b>אסור:</b> שמות של מתאמנות, פרטים אישיים, מידע רפואי עליהן</span></li>
+    </ul>
+    ${first ? `<button type="button" class="btn wide" data-a="privacy-ok">הבנתי</button>` : ""}`);
+}
+/* Improvement ideas: saved to the "suggestions" table, Claude reads them */
+function openIdea() {
+  sheetCtx = { kind: "idea" };
+  sheet(`<h3 id="sheet-title">💡 הצעה לשיפור</h3>
+    <label for="idea-text" class="note-local">מה חסר, מה מעצבן, מה היה עוזר?</label>
+    <textarea class="inp" id="idea-text" maxlength="2000" style="min-height:120px"></textarea>
+    <button type="button" class="btn wide" data-a="idea-send">שליחה</button>`);
+  setTimeout(() => { const t = document.getElementById("idea-text"); if (t) t.focus(); }, 50);
 }
 
 /* ===== Sheets ===== */
@@ -545,8 +672,11 @@ function openBackup(restoreMode) {
   const last = b.at && !b.dirty ? `הגיבוי האחרון: ${daysAgo(new Date(b.at).toISOString().slice(0, 10))}.` : b.dirty ? "יש שינויים שעוד לא גובו." : "";
   sheet(`<h3 id="sheet-title">גיבוי</h3>
     ${last ? `<p><b>${last}</b></p>` : ""}
-    <p>כל מה ששמרת (${nP} מערכים, ${nE} תרגילים משלך וסימוני "העברתי היום") נשמר <b>רק בטלפון הזה</b>. אם מוחקים את נתוני הדפדפן או מחליפים טלפון, זה נמחק.</p>
-    <p class="note-local">כדאי לשמור גיבוי מדי פעם, למשל לשלוח אותו לעצמך בוואטסאפ. הסרטונים לא נכללים בגיבוי.</p>
+    ${window.CLOUD ? `<p>כל מה ששמרת (${nP} מערכים, ${nE} תרגילים משלך וסימוני "העברתי היום") <b>נשמר בענן</b>, ואפשר להיכנס מכל טלפון. <b>הסרטונים עדיין נשמרים רק בטלפון הזה.</b></p>
+    <p class="note-local">מחוברת בתור <span dir="ltr">${esc(CLOUD.email)}</span> · <button type="button" class="linkish" data-a="sign-out">יציאה</button></p>
+    <p class="note-local">גיבוי נוסף לקובץ הוא לא חובה, אבל אפשר:</p>`
+    : `<p>כל מה ששמרת (${nP} מערכים, ${nE} תרגילים משלך וסימוני "העברתי היום") נשמר <b>רק בטלפון הזה</b>. אם מוחקים את נתוני הדפדפן או מחליפים טלפון, זה נמחק.</p>
+    <p class="note-local">כדאי לשמור גיבוי מדי פעם, למשל לשלוח אותו לעצמך בוואטסאפ. הסרטונים לא נכללים בגיבוי.</p>`}
     <div class="row"><button type="button" class="btn" data-a="bk-copy">העתקת הגיבוי</button><a class="btn ghost" id="bk-file" download="shai-studio-backup.json" href="#">שמירה כקובץ</a></div>
     <textarea class="inp" id="bk-text" readonly aria-label="טקסט הגיבוי" style="min-height:90px;font-size:12px" dir="ltr"></textarea>
     <h4>שחזור מגיבוי</h4>
@@ -604,6 +734,7 @@ document.addEventListener("click", async e => {
   switch (a.dataset.a) {
     case "today": S.today = S.today.includes(id) ? S.today.filter(x => x !== id) : [...S.today, id]; store.set("shai_today", S.today); render(); break;
     case "sort": S.sort = id; store.set("shai_sort", id); render(); break;
+    case "src": S.src = id; store.set("shai_src", id); render(); break;
     case "plan": S.plan = id; S.confirm = null; render(); window.scrollTo(0, 0); break;
     case "back": S.plan = null; render(); break;
     case "area": S.area = id; render(); break;
@@ -646,11 +777,24 @@ document.addEventListener("click", async e => {
       save(); closeOverlay(); render(); toast("התרגיל נמחק"); break; }
     case "vid-del": { const xid = sheetCtx.id; try { await VID.del(xid); videoIds.delete(xid); toast("הסרטון נמחק"); } catch (err) { toast("לא הצלחתי למחוק"); } openEx(xid); render(); break; }
     case "backup": openBackup(); break;
+    case "privacy": openPrivacy(false); break;
+    case "privacy-ok": store.set("shai_privacy_ok", 1); closeOverlay(); break;
+    case "idea": openIdea(); break;
+    case "idea-send": {
+      const t = document.getElementById("idea-text"), body = t.value.trim();
+      if (!body) { toast("קודם כותבים משהו"); t.focus(); break; }
+      a.disabled = true; a.textContent = "שולחת...";
+      let ok = false;
+      try { const r = await CLOUD.sb.from("suggestions").insert({ body }); ok = !r.error; } catch (err) {}
+      if (ok) { closeOverlay(); toast("תודה! ההצעה נשלחה"); }
+      else { a.disabled = false; a.textContent = "שליחה"; toast("לא נשלח. אולי אין אינטרנט. נסי שוב בעוד רגע."); }
+      break; }
     case "bk-copy": {
       const tx = document.getElementById("bk-text");
       const sel = () => { tx.focus(); tx.select(); markBackedUp(); render(); toast("סימנתי את הטקסט. לוחצים לחיצה ארוכה ו״העתק״."); };
       if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(tx.value).then(() => { markBackedUp(); render(); toast("הגיבוי הועתק. אפשר להדביק בוואטסאפ לעצמך."); }, sel); else sel();
       break; }
+    case "sign-out": if (window.CLOUD) CLOUD.signOut(); break;
     case "bk-later": store.set("shai_bk_snooze", Date.now() + 3 * 864e5); render(); break;
     case "bk-restore": {
       const v = document.getElementById("bk-in").value.trim();
@@ -696,4 +840,5 @@ if ("serviceWorker" in navigator && ON_OWN_SITE) {
   navigator.serviceWorker.register("sw.js").catch(() => {});
 }
 render();
+if (window.CLOUD && !store.get("shai_privacy_ok", 0)) openPrivacy(true);
 </script>
