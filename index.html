@@ -384,6 +384,87 @@ const VID = {
 let videoIds = new Set();
 VID.keys().then(k => { videoIds = new Set(k || []); if (S.tab === "lib") render(); }).catch(() => {});
 
+/* ===== Videos in the cloud (private Supabase bucket "videos", one file per exercise id) =====
+   This device keeps a copy in IndexedDB (works offline). shai_vid_meta[id]:
+   "" = waiting to upload · "big" = too big for the cloud, kept here only · otherwise = the cloud copy's updated_at. */
+const VMAX = 50 * 1024 * 1024;
+const VSYNC = {
+  meta: store.get("shai_vid_meta", {}),
+  dels: store.get("shai_vid_del", []),
+  cloud: null,   // Map id -> updated_at, after the first successful listing
+  p: Promise.resolve(),
+  keep() { store.set("shai_vid_meta", this.meta); store.set("shai_vid_del", this.dels); },
+  ok: id => /^[A-Za-z0-9_-]{1,200}$/.test(id),
+  bucket: () => CLOUD.sb.storage.from("videos"),
+  async list() {
+    const out = new Map();
+    for (let off = 0; ; off += 1000) {
+      const r = await this.bucket().list("", { limit: 1000, offset: off });
+      if (r.error) throw r.error;
+      r.data.forEach(o => { if (o.id) out.set(o.name, o.updated_at || o.created_at || "x"); });
+      if (r.data.length < 1000) break;
+    }
+    return out;
+  },
+  run() { if (!window.CLOUD) return Promise.resolve(); return (this.p = this.p.then(() => this._run()).catch(e => console.warn("[shai] video sync failed, will retry", e))); },
+  async _run() {
+    if (navigator.onLine === false) return;
+    for (const id of [...this.dels]) {   // deletions made here
+      const r = await this.bucket().remove([id]); if (r.error) throw r.error;
+      this.dels = this.dels.filter(x => x !== id); this.keep();
+    }
+    let local = new Set(await VID.keys().catch(() => []));
+    for (const id of local) {   // copies on this device that never reached the cloud (incl. videos from before the cloud)
+      if (!this.ok(id) || this.meta[id]) continue;
+      const blob = await VID.get(id); if (!blob) continue;
+      if (blob.size > VMAX) { this.meta[id] = "big"; this.keep(); continue; }
+      const r = await this.bucket().upload(id, blob, { upsert: true, contentType: blob.type || "video/mp4", cacheControl: "31536000" });
+      if (r.error) { if (/maximum|too large|413/i.test(r.error.message + " " + r.error.statusCode)) { this.meta[id] = "big"; this.keep(); continue; } throw r.error; }
+      this.meta[id] = "up"; this.keep();
+    }
+    const cloud = await this.list(); this.cloud = cloud;
+    for (const id of local) {
+      const m = this.meta[id]; if (!m || m === "big") continue;
+      if (!cloud.has(id)) { if (m !== "up") { await VID.del(id).catch(() => {}); delete this.meta[id]; } }   // deleted on the other phone
+      else if (m === "up") this.meta[id] = cloud.get(id);
+      else if (m !== cloud.get(id)) { await VID.del(id).catch(() => {}); delete this.meta[id]; }   // replaced on the other phone: download again when opened
+    }
+    this.keep();
+    local = new Set(await VID.keys().catch(() => []));
+    const next = new Set([...local, ...cloud.keys()]);
+    const changed = next.size !== videoIds.size || [...next].some(id => !videoIds.has(id));
+    videoIds = next;
+    if (changed) render();
+  },
+  async blob(id, onDownload) {   // this device's copy, or download from the cloud once and keep it
+    let b = await VID.get(id).catch(() => null);
+    if (b || !window.CLOUD || !this.ok(id)) return b;
+    if (onDownload) onDownload();
+    const r = await this.bucket().download(id); if (r.error) throw r.error;
+    b = r.data;
+    try { await VID.put(id, b); this.meta[id] = (this.cloud && this.cloud.get(id)) || "x"; this.keep(); } catch (e) {}   // phone full: just play it
+    return b;
+  },
+  async remove(id) {
+    await VID.del(id).catch(() => {});
+    videoIds.delete(id);
+    if (window.CLOUD && this.ok(id)) { delete this.meta[id]; if (!this.dels.includes(id)) this.dels.push(id); if (this.cloud) this.cloud.delete(id); this.keep(); this.run(); }
+  },
+  async add(id) {   // the file is already in this device's copy (VID.put)
+    videoIds.add(id);
+    if (window.CLOUD && this.ok(id)) { this.dels = this.dels.filter(x => x !== id); this.meta[id] = ""; this.keep(); await this.run(); }
+  },
+  status(id) {   // short note under the video
+    if (!window.CLOUD) return "הסרטון נשמר רק בטלפון הזה.";
+    const m = this.meta[id];
+    if (!videoIds.has(id)) return "הסרטון יישמר בענן, ואפשר לראות אותו מכל טלפון.";
+    if (m === "big") return "הסרטון גדול מדי לענן ונשמר רק בטלפון הזה. כדאי להחליף בסרטון קצר יותר.";
+    if (m === "") return "הסרטון יעלה לענן כשיהיה אינטרנט.";
+    return "הסרטון שמור בענן.";
+  },
+};
+if (window.CLOUD) { VSYNC.run(); window.addEventListener("online", () => VSYNC.run()); }
+
 /* ===== State ===== */
 const S = { mode: store.get("shai_mode", "barre"), tab: "plans", plan: null, edit: null, today: store.get("shai_today", []), q: "", area: "", sort: store.get("shai_sort", "default"), src: store.get("shai_src", "all"), confirm: null };
 const main = document.getElementById("main");
@@ -591,7 +672,7 @@ async function openEx(id, confirmDel) {
       <div class="row" style="justify-content:center">
         <label class="btn ghost file-btn">${hasV ? "החלפת סרטון" : "הוספת סרטון"}<input type="file" accept="video/*" id="vid-in" aria-label="בחירת סרטון"></label>
         ${hasV ? `<button type="button" class="btn danger" data-a="vid-del">מחיקת הסרטון</button>` : ""}
-      </div><span class="note-local">הסרטון נשמר רק בטלפון הזה.</span></div>
+      </div><span class="note-local">${VSYNC.status(id)}</span></div>
     ${e.c ? `<h4>איך עושים</h4><p>${esc(e.c)}</p>` : ""}
     ${e.g && e.g.length ? `<h4>ציוד</h4><p>${esc(e.g.join(", "))}</p>` : ""}
     ${e.v && e.v.length ? `<h4>גרסאות</h4><ul>${e.v.map(v => `<li>${esc(v)}</li>`).join("")}</ul>` : ""}
@@ -599,7 +680,8 @@ async function openEx(id, confirmDel) {
     ${e.own ? (confirmDel ? `<div class="confirm"><b>למחוק את התרגיל?</b><span>הוא יוסר גם מהמערכים שלך. אי אפשר לבטל.</span><div class="row"><button type="button" class="btn danger" data-a="ex-del-yes">כן, למחוק</button><button type="button" class="btn ghost" data-a="ex-del-no">ביטול</button></div></div>`
       : `<div class="row"><button type="button" class="btn ghost" data-a="ex-edit">עריכת התרגיל</button><button type="button" class="btn danger" data-a="ex-del">מחיקה</button></div>`) : ""}`);
   if (hasV) {
-    try { const blob = await VID.get(id); const box = document.getElementById("vid-box");
+    try { const blob = await VSYNC.blob(id, () => { const b = document.getElementById("vid-box"); if (b && sheetCtx && sheetCtx.id === id) b.firstChild.textContent = "מוריד את הסרטון מהענן..."; });
+      const box = document.getElementById("vid-box");
       if (blob && box && sheetCtx && sheetCtx.id === id) { objUrl = URL.createObjectURL(blob); const v = document.createElement("video");
         v.src = objUrl; v.controls = true; v.playsInline = true; v.preload = "metadata"; box.firstChild.replaceWith(v); } }
     catch (err) { const box = document.getElementById("vid-box"); if (box) box.firstChild.textContent = "לא הצלחתי לטעון את הסרטון"; }
@@ -672,7 +754,7 @@ function openBackup(restoreMode) {
   const last = b.at && !b.dirty ? `הגיבוי האחרון: ${daysAgo(new Date(b.at).toISOString().slice(0, 10))}.` : b.dirty ? "יש שינויים שעוד לא גובו." : "";
   sheet(`<h3 id="sheet-title">גיבוי</h3>
     ${last ? `<p><b>${last}</b></p>` : ""}
-    ${window.CLOUD ? `<p>כל מה ששמרת (${nP} מערכים, ${nE} תרגילים משלך וסימוני "העברתי היום") <b>נשמר בענן</b>, ואפשר להיכנס מכל טלפון. <b>הסרטונים עדיין נשמרים רק בטלפון הזה.</b></p>
+    ${window.CLOUD ? `<p>כל מה ששמרת (${nP} מערכים, ${nE} תרגילים משלך וסימוני "העברתי היום") <b>נשמר בענן</b>, ואפשר להיכנס מכל טלפון. גם הסרטונים נשמרים בענן.</p>
     <p class="note-local">מחוברת בתור <span dir="ltr">${esc(CLOUD.email)}</span> · <button type="button" class="linkish" data-a="sign-out">יציאה</button></p>
     <p class="note-local">גיבוי נוסף לקובץ הוא לא חובה, אבל אפשר:</p>`
     : `<p>כל מה ששמרת (${nP} מערכים, ${nE} תרגילים משלך וסימוני "העברתי היום") נשמר <b>רק בטלפון הזה</b>. אם מוחקים את נתוני הדפדפן או מחליפים טלפון, זה נמחק.</p>
@@ -773,9 +855,9 @@ document.addEventListener("click", async e => {
     case "ex-del-yes": {
       const xid = sheetCtx.id; delete DB.ex[xid]; delete EX[xid];
       DB.plans.forEach(pl => pl.s.forEach(s => { s[2] = s[2].filter(it => it[0] !== xid); }));
-      try { await VID.del(xid); videoIds.delete(xid); } catch (err) {}
+      try { await VSYNC.remove(xid); } catch (err) {}
       save(); closeOverlay(); render(); toast("התרגיל נמחק"); break; }
-    case "vid-del": { const xid = sheetCtx.id; try { await VID.del(xid); videoIds.delete(xid); toast("הסרטון נמחק"); } catch (err) { toast("לא הצלחתי למחוק"); } openEx(xid); render(); break; }
+    case "vid-del": { const xid = sheetCtx.id; try { await VSYNC.remove(xid); toast("הסרטון נמחק"); } catch (err) { toast("לא הצלחתי למחוק"); } openEx(xid); render(); break; }
     case "backup": openBackup(); break;
     case "privacy": openPrivacy(false); break;
     case "privacy-ok": store.set("shai_privacy_ok", 1); closeOverlay(); break;
@@ -821,10 +903,16 @@ document.addEventListener("change", async e => {
   const el = e.target;
   if (el.id === "vid-in" && el.files && el.files[0] && sheetCtx) {
     const file = el.files[0], xid = sheetCtx.id;
+    el.value = "";
+    if (window.CLOUD && file.size > VMAX) { toast("הסרטון גדול מדי (מעל 50MB). צלמי סרטון קצר יותר, עד חצי דקה בערך."); return; }
     if (file.size > 300 * 1024 * 1024) { toast("הסרטון גדול מדי. עדיף סרטון קצר."); return; }
-    toast("שומר את הסרטון...");
-    try { await VID.put(xid, file); videoIds.add(xid); toast("הסרטון נשמר"); openEx(xid); render(); }
-    catch (err) { toast("לא הצלחתי לשמור את הסרטון. אולי אין מקום בטלפון."); }
+    toast(window.CLOUD ? "שומר ומעלה לענן..." : "שומר את הסרטון...");
+    try { await VID.put(xid, file); }
+    catch (err) { toast("לא הצלחתי לשמור את הסרטון. אולי אין מקום בטלפון."); return; }
+    try { await VSYNC.add(xid); } catch (err) {}
+    const m = VSYNC.meta[xid];
+    toast(!window.CLOUD ? "הסרטון נשמר" : m === "" ? "הסרטון נשמר בטלפון, ויעלה לענן כשיהיה אינטרנט" : m === "big" ? "הסרטון נשמר רק בטלפון (גדול מדי לענן)" : "הסרטון עלה לענן");
+    if (sheetCtx && sheetCtx.id === xid) openEx(xid); render();
   }
   if (el.id === "bk-filein" && el.files && el.files[0]) {
     try { document.getElementById("bk-in").value = await el.files[0].text(); toast("הקובץ נטען. עכשיו לוחצים שחזור."); } catch (err) { toast("לא הצלחתי לקרוא את הקובץ"); }
