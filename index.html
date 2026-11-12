@@ -193,6 +193,22 @@ details.tips ul { margin: 0; padding-inline-start: 20px }
 .wl { font-size: 13px; color: var(--muted) }
 .toast { position: fixed; z-index: 60; inset-inline: 16px; bottom: calc(76px + env(safe-area-inset-bottom, 0px)); margin: 0 auto; max-width: 420px; background: var(--fg); color: var(--bg); border-radius: 12px; padding: 10px 14px; text-align: center; font-weight: 600 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important } }
+.vmeter { height: 8px; border-radius: 99px; background: var(--line); overflow: hidden; margin: 4px 0 0 }
+.vmeter span { display: block; height: 100%; background: var(--tone) }
+.vmeter.full span { background: #b3412e }
+.share-row { margin-top: 8px }
+#print-area { display: none }
+@media print {
+  body > *:not(#print-area) { display: none !important }
+  body { background: #fff !important }
+  #print-area { display: block; color: #000; font-size: 13pt; line-height: 1.5 }
+  #print-area h1 { font-size: 20pt; margin: 0 0 2pt }
+  #print-area .sub { color: #444; margin: 0 0 8pt }
+  #print-area h2 { font-size: 14pt; margin: 14pt 0 4pt; padding-bottom: 2pt; border-bottom: 1px solid #999; display: flex; justify-content: space-between }
+  #print-area ul { list-style: none; padding: 0; margin: 0 }
+  #print-area li { margin: 3pt 0; display: flex; justify-content: space-between; gap: 12pt; break-inside: avoid }
+  #print-area li span:first-child::before { content: "☐  " }
+}
 </style>
 
 <div class="app" dir="rtl" lang="he">
@@ -397,13 +413,14 @@ const VSYNC = {
   ok: id => /^[A-Za-z0-9_-]{1,200}$/.test(id),
   bucket: () => CLOUD.sb.storage.from("videos"),
   async list() {
-    const out = new Map();
+    const out = new Map(), sizes = new Map();
     for (let off = 0; ; off += 1000) {
       const r = await this.bucket().list("", { limit: 1000, offset: off });
       if (r.error) throw r.error;
-      r.data.forEach(o => { if (o.id) out.set(o.name, o.updated_at || o.created_at || "x"); });
+      r.data.forEach(o => { if (o.id) { out.set(o.name, o.updated_at || o.created_at || "x"); sizes.set(o.name, (o.metadata && o.metadata.size) || 0); } });
       if (r.data.length < 1000) break;
     }
+    this.sizes = sizes;
     return out;
   },
   run() { if (!window.CLOUD) return Promise.resolve(); return (this.p = this.p.then(() => this._run()).catch(e => console.warn("[shai] video sync failed, will retry", e))); },
@@ -415,16 +432,17 @@ const VSYNC = {
     }
     let local = new Set(await VID.keys().catch(() => []));
     for (const id of local) {   // copies on this device that never reached the cloud (incl. videos from before the cloud)
-      if (!this.ok(id) || this.meta[id]) continue;
+      if (!this.ok(id) || (this.meta[id] && this.meta[id] !== "full")) continue;
       const blob = await VID.get(id); if (!blob) continue;
       if (blob.size > VMAX) { this.meta[id] = "big"; this.keep(); continue; }
+      if (this.cloud) { const u = this.usage(); if (u.bytes - (this.sizes.get(id) || 0) + blob.size > VLIMIT) { this.meta[id] = "full"; this.keep(); continue; } }
       const r = await this.bucket().upload(id, blob, { upsert: true, contentType: blob.type || "video/mp4", cacheControl: "31536000" });
       if (r.error) { if (/maximum|too large|413/i.test(r.error.message + " " + r.error.statusCode)) { this.meta[id] = "big"; this.keep(); continue; } throw r.error; }
       this.meta[id] = "up"; this.keep();
     }
     const cloud = await this.list(); this.cloud = cloud;
     for (const id of local) {
-      const m = this.meta[id]; if (!m || m === "big") continue;
+      const m = this.meta[id]; if (!m || m === "big" || m === "full") continue;
       if (!cloud.has(id)) { if (m !== "up") { await VID.del(id).catch(() => {}); delete this.meta[id]; } }   // deleted on the other phone
       else if (m === "up") this.meta[id] = cloud.get(id);
       else if (m !== cloud.get(id)) { await VID.del(id).catch(() => {}); delete this.meta[id]; }   // replaced on the other phone: download again when opened
@@ -434,7 +452,7 @@ const VSYNC = {
     const next = new Set([...local, ...cloud.keys()]);
     const changed = next.size !== videoIds.size || [...next].some(id => !videoIds.has(id));
     videoIds = next;
-    if (changed) render();
+    if (changed || vidAlmostFull()) render();
   },
   async blob(id, onDownload) {   // this device's copy, or download from the cloud once and keep it
     let b = await VID.get(id).catch(() => null);
@@ -448,7 +466,7 @@ const VSYNC = {
   async remove(id) {
     await VID.del(id).catch(() => {});
     videoIds.delete(id);
-    if (window.CLOUD && this.ok(id)) { delete this.meta[id]; if (!this.dels.includes(id)) this.dels.push(id); if (this.cloud) this.cloud.delete(id); this.keep(); this.run(); }
+    if (window.CLOUD && this.ok(id)) { delete this.meta[id]; if (!this.dels.includes(id)) this.dels.push(id); if (this.cloud) this.cloud.delete(id); this.sizes.delete(id); this.keep(); this.run(); }
   },
   async add(id) {   // the file is already in this device's copy (VID.put)
     videoIds.add(id);
@@ -459,10 +477,22 @@ const VSYNC = {
     const m = this.meta[id];
     if (!videoIds.has(id)) return "הסרטון יישמר בענן, ואפשר לראות אותו מכל טלפון.";
     if (m === "big") return "הסרטון גדול מדי לענן ונשמר רק בטלפון הזה. כדאי להחליף בסרטון קצר יותר.";
+    if (m === "full") return "אין מספיק מקום בענן, ולכן הסרטון נשמר רק בטלפון הזה. כדאי להגיד לגיא.";
     if (m === "") return "הסרטון יעלה לענן כשיהיה אינטרנט.";
     return "הסרטון שמור בענן.";
   },
+  sizes: new Map(),
+  usage() { let bytes = 0; this.sizes.forEach(s => { bytes += s; }); return { n: this.sizes.size, bytes }; },
 };
+const VLIMIT = 1024 * 1024 * 1024;   // Supabase free plan: 1GB of files
+const mb = b => b >= VLIMIT ? (b / VLIMIT).toFixed(1) + "GB" : Math.round(b / 1048576) + "MB";
+function vidMeter() {
+  if (!window.CLOUD || !VSYNC.cloud) return "";
+  const u = VSYNC.usage(), pct = Math.min(100, Math.round(u.bytes / VLIMIT * 100));
+  return `<p class="note-local">🎬 ${u.n} ${u.n === 1 ? "סרטון" : "סרטונים"} בענן · ${mb(u.bytes)} מתוך 1GB</p>
+    <div class="vmeter ${pct >= 80 ? "full" : ""}" role="img" aria-label="נוצלו ${pct}% מהמקום לסרטונים"><span style="width:${Math.max(pct, u.bytes ? 1 : 0)}%"></span></div>`;
+}
+function vidAlmostFull() { return !!(window.CLOUD && VSYNC.cloud && VSYNC.usage().bytes >= VLIMIT * 0.8); }
 if (window.CLOUD) { VSYNC.run(); window.addEventListener("online", () => VSYNC.run()); }
 
 /* ===== State ===== */
@@ -550,10 +580,39 @@ function viewPlan(p) {
     <button type="button" class="btn ${taughtToday ? "done" : "ghost"}" data-a="taught">${taughtToday ? "✓ הועבר היום" : "העברתי היום"}</button>
     ${isMine(p) ? `<button type="button" class="btn ghost" data-a="edit">עריכה</button>` : `<button type="button" class="btn ghost" data-a="dup">שכפול ועריכה</button>`}
     ${sp ? `<a class="btn ghost" href="${esc(sp)}" target="_blank" rel="noopener">פלייליסט ↗</a>` : ""}
-  </div></div>
+  </div>
+  <div class="row share-row"><button type="button" class="btn ghost" data-a="share">📤 שיתוף</button><button type="button" class="btn ghost" data-a="print">🖨️ הדפסה</button></div></div>
   ${todayBox()}
   ${p.s.map(([name, m, items]) => `<div class="sec"><div class="sec-h">${esc(name)}<span>${esc(m)} דק׳</span></div>${items.map(([id, d]) => itemRow(id, d)).join("") || `<div class="item"><span class="hint">אין עדיין תרגילים בחלק הזה</span></div>`}</div>`).join("")}
   <p class="lead">לוחצים על תרגיל כדי לראות הסבר, גרסאות, התאמות וסרטון.</p></div>`;
+}
+
+/* ===== Share / print a plan ===== */
+function planText(p) {   // WhatsApp-friendly (*bold*)
+  const out = [`*${p.n}* · ${planMins(p)} דק׳`];
+  if (p.d) out.push(p.d);
+  p.s.forEach(([name, m, items]) => {
+    out.push("", `*${name}*${m ? ` · ${m} דק׳` : ""}`);
+    items.forEach(([id, d]) => { const e = EX[id]; if (e) out.push(`• ${e.n}${d ? " – " + d : ""}`); });
+  });
+  return out.join("\n");
+}
+async function sharePlan(p) {
+  const text = planText(p);
+  if (navigator.share) {
+    try { await navigator.share({ title: p.n, text }); return; }
+    catch (err) { if (err && err.name === "AbortError") return; }
+  }
+  try { await navigator.clipboard.writeText(text); toast("המערך הועתק. אפשר להדביק בוואטסאפ."); }
+  catch (err) { toast("לא הצלחתי לשתף. נסי שוב."); }
+}
+function printPlan(p) {
+  let box = document.getElementById("print-area");
+  if (!box) { box = document.createElement("div"); box.id = "print-area"; box.dir = "rtl"; document.body.appendChild(box); }
+  box.innerHTML = `<h1>${esc(p.n)}</h1><p class="sub">${p.d ? esc(p.d) + " · " : ""}${planMins(p)} דקות · ${S.mode === "barre" ? "בר" : "מזרון"}</p>
+    ${p.s.map(([name, m, items]) => `<h2><span>${esc(name)}</span><span>${m ? esc(m) + " דק׳" : ""}</span></h2>
+      <ul>${items.map(([id, d]) => EX[id] ? `<li><span>${esc(EX[id].n)}</span><span>${esc(d || "")}</span></li>` : "").join("")}</ul>`).join("")}`;
+  try { window.print(); } catch (err) { toast("ההדפסה לא זמינה כאן."); }
 }
 
 /* ===== Edit a plan (only Shai's own) ===== */
@@ -628,6 +687,8 @@ function render() {
   if (S.tab === "plans" && !S.plan && !S.edit && needsBackup()) main.insertAdjacentHTML("afterbegin",
     `<div class="bk-remind" role="status"><p><b>הגיע הזמן לגיבוי.</b> עברו יותר משבועיים, ויש שינויים שנשמרו רק בטלפון הזה.</p>
      <div class="row"><button type="button" class="btn" data-a="backup">גיבוי עכשיו</button><button type="button" class="btn ghost" data-a="bk-later">אחר כך</button></div></div>`);
+  if (S.tab === "plans" && !S.plan && !S.edit && vidAlmostFull()) main.insertAdjacentHTML("afterbegin",
+    `<div class="bk-remind" role="status"><p><b>⚠️ המקום לסרטונים בענן כמעט מלא</b> (${mb(VSYNC.usage().bytes)} מתוך 1GB). כדאי להגיד לגיא.</p>${vidMeter()}</div>`);
   if (!S.plan && !S.edit) main.insertAdjacentHTML("beforeend", `<footer class="app-foot">
     ${window.CLOUD ? `<p>💡 יש לך הצעה לשיפור? <button type="button" class="linkish" data-a="idea">כתבי כאן</button></p>` : ""}
     <p><button type="button" class="linkish" data-a="privacy">מה מותר לכתוב כאן</button></p></footer>`);
@@ -756,6 +817,7 @@ function openBackup(restoreMode) {
     ${last ? `<p><b>${last}</b></p>` : ""}
     ${window.CLOUD ? `<p>כל מה ששמרת (${nP} מערכים, ${nE} תרגילים משלך וסימוני "העברתי היום") <b>נשמר בענן</b>, ואפשר להיכנס מכל טלפון. גם הסרטונים נשמרים בענן.</p>
     <p class="note-local">מחוברת בתור <span dir="ltr">${esc(CLOUD.email)}</span> · <button type="button" class="linkish" data-a="sign-out">יציאה</button></p>
+    ${vidMeter()}
     <p class="note-local">גיבוי נוסף לקובץ הוא לא חובה, אבל אפשר:</p>`
     : `<p>כל מה ששמרת (${nP} מערכים, ${nE} תרגילים משלך וסימוני "העברתי היום") נשמר <b>רק בטלפון הזה</b>. אם מוחקים את נתוני הדפדפן או מחליפים טלפון, זה נמחק.</p>
     <p class="note-local">כדאי לשמור גיבוי מדי פעם, למשל לשלוח אותו לעצמך בוואטסאפ. הסרטונים לא נכללים בגיבוי.</p>`}
@@ -824,6 +886,8 @@ document.addEventListener("click", async e => {
     case "class": openClass(); break;
     case "close": closeOverlay(); break;
     case "close-bg": if (e.target === a) closeOverlay(); break;
+    case "share": if (p) sharePlan(p); break;
+    case "print": if (p) printPlan(p); break;
     case "taught": {
       const l = DB.log[p.id] = DB.log[p.id] || [];
       if (l[l.length - 1] === todayISO()) { l.pop(); toast("הסימון בוטל"); } else { l.push(todayISO()); toast("נרשם שהעברת את המערך היום"); }
@@ -911,7 +975,7 @@ document.addEventListener("change", async e => {
     catch (err) { toast("לא הצלחתי לשמור את הסרטון. אולי אין מקום בטלפון."); return; }
     try { await VSYNC.add(xid); } catch (err) {}
     const m = VSYNC.meta[xid];
-    toast(!window.CLOUD ? "הסרטון נשמר" : m === "" ? "הסרטון נשמר בטלפון, ויעלה לענן כשיהיה אינטרנט" : m === "big" ? "הסרטון נשמר רק בטלפון (גדול מדי לענן)" : "הסרטון עלה לענן");
+    toast(!window.CLOUD ? "הסרטון נשמר" : m === "" ? "הסרטון נשמר בטלפון, ויעלה לענן כשיהיה אינטרנט" : m === "big" ? "הסרטון נשמר רק בטלפון (גדול מדי לענן)" : m === "full" ? "אין מספיק מקום בענן. הסרטון נשמר רק בטלפון." : "הסרטון עלה לענן");
     if (sheetCtx && sheetCtx.id === xid) openEx(xid); render();
   }
   if (el.id === "bk-filein" && el.files && el.files[0]) {
